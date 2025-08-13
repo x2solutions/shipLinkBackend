@@ -218,30 +218,37 @@ def format_response():
     contacts = (data.get("contacts") or [])[:10]
     notes = (data.get("notes") or "").strip()
 
-    system_msg = (
-        "You are a concise, friendly assistant. You will be given structured results. "
-        "Write a short, conversational reply that summarizes the key info for the user. "
-        "If contacts exist, list 3–6 with name, title, location, and a LinkedIn link if available. "
-        "If no data is available, ask a brief clarifying question."
-    )
-
     if client is None:
         return http_json_error("OPENAI_API_KEY is not set on the server.", 500)
 
     try:
+        if intent == "Point of Contact":
+            system_msg = (
+                "You are a concise, friendly assistant. You will be given structured results. "
+                "Write a short, conversational reply that summarizes the key info for the user. "
+                "If contacts exist, list 3–6 with name, title, location, and a LinkedIn link if available. "
+                "If no data is available, ask a brief clarifying question."
+            )
+            user_content = json.dumps({
+                "intent": intent,
+                "original_query": original_query,
+                "contacts": contacts,
+                "notes": notes
+            }, ensure_ascii=False)
+
+        else:
+            # Fallback for "unsupported" or other custom intents → treat as ChatGPT-style Q&A
+            system_msg = "You are ChatGPT, a helpful assistant. Respond to the user naturally and helpfully."
+            user_content = original_query
+
         resp = client.chat.completions.create(
             model=MODEL_FORMAT,
             messages=[
                 {"role": "system", "content": system_msg},
-                {"role": "user", "content": json.dumps({
-                    "intent": intent,
-                    "original_query": original_query,
-                    "contacts": contacts,
-                    "notes": notes
-                }, ensure_ascii=False)}
+                {"role": "user", "content": user_content}
             ],
-            max_tokens=220,
-            temperature=0.2
+            max_tokens=300,
+            temperature=0.3
         )
         text = (resp.choices[0].message.content or "").strip()
     except Exception as e:
