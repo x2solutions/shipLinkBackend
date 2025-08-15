@@ -48,24 +48,50 @@ def ensure_int(n, default=5, low=1, high=20):
     except Exception:
         return default
 
+# ---------- Apollo → compact contacts ----------
 def simplify_apollo_contacts(raw):
-    """Map Apollo response into a clean list for Bubble + formatter."""
-    contacts = []
+    """
+    Return a compact, uniform list of contacts with ONLY these keys:
+    name, title, location, email_status, linkedin_url, email, phone
+    (email/phone will be "" if not available)
+    """
+    def pick_location(c):
+        city = (c.get("city") or c.get("location") or "").strip()
+        state = (c.get("state") or "").strip()
+        country = (c.get("country") or "").strip()
+        parts = [p for p in [city, state or None, country or None] if p]
+        return ", ".join(parts) if parts else ""
+
+    def pick_email(c):
+        # Free Apollo often returns "email_not_unlocked@domain.com"
+        e = (c.get("email") or "").strip()
+        if e.lower().startswith("email_not_unlocked"):
+            return ""
+        return e
+
+    def pick_phone(c):
+        phones = c.get("phone_numbers") or []
+        if isinstance(phones, list):
+            for p in phones:
+                num = (p.get("sanitized_number") or p.get("number") or "").strip()
+                if num:
+                    return num
+        # avoid leaking org phone numbers as person phones
+        return ""
+
     items = raw.get("contacts") or raw.get("people") or []
+    out = []
     for c in items:
-        name = c.get("name") or "Unknown"
-        title = c.get("title") or c.get("headline") or ""
-        loc = c.get("city") or c.get("location") or ""
-        linkedin = c.get("linkedin_url") or c.get("linkedin") or ""
-        email_status = c.get("email_status") or c.get("contact_email_status") or ""
-        contacts.append({
-            "name": name,
-            "title": title,
-            "location": loc,
-            "linkedin_url": linkedin,
-            "email_status": email_status
+        out.append({
+            "name": (c.get("name") or "").strip(),
+            "title": (c.get("title") or c.get("headline") or "").strip(),
+            "location": pick_location(c),
+            "email_status": (c.get("email_status") or c.get("contact_email_status") or "").strip(),
+            "linkedin_url": (c.get("linkedin_url") or c.get("linkedin") or "").strip(),
+            "email": pick_email(c),
+            "phone": pick_phone(c),
         })
-    return contacts
+    return out
 
 # ----- simple header auth for Bubble → backend -----
 def require_backend_token():
@@ -85,7 +111,6 @@ def require_backend_token():
 )
 def chat_json(messages, model=MODEL_INTENT, max_tokens=150, temperature=0):
     if client is None:
-        # Fail fast with clear message instead of AttributeError: 'NoneType'...
         raise RuntimeError("OPENAI_API_KEY is not set on the server.")
     resp = client.chat.completions.create(
         model=model,
@@ -104,8 +129,8 @@ def index():
         "<p>POST endpoints:</p>"
         "<ul>"
         "<li><code>/extract-intent</code> — body: {\"text\":\"...\"}</li>"
-        "<li><code>/find-person</code> — body: {\"titles\":[],\"domains\":[],\"count\":5}</li>"
-        "<li><code>/format-response</code> — body with contacts list</li>"
+        "<li><code>/find-person</code> — body: {\"titles\":[],\"domains\":[],\"count\":5, \"include_raw\": false}</li>"
+        "<li><code>/format-response</code> — body: {intent, original_query, contacts[], notes}</li>"
         "</ul>"
         "<p>Health: <a href='/health'>/health</a></p>",
         200
@@ -134,11 +159,18 @@ def extract_intent():
             "intent": "unsupported", "titles": None, "domains": None, "count": None
         })
 
+    # More prescriptive and domain-savvy classification
     system_msg = (
-        'Classify the user request as one of: "Point of Contact", "Data Traffic", or "unsupported". '
-        'Only if intent is "Point of Contact", also extract: '
-        '`titles` (array), `domains` (array), and `count` (number, default 5). '
-        'Return ONLY JSON: {"intent": string, "titles": array|null, "domains": array|null, "count": number|null}.'
+        'Return ONLY JSON with keys exactly: '
+        '{"intent": string, "titles": array|null, "domains": array|null, "count": number|null}. '
+        'Classify intent as one of: "Point of Contact", "Data Traffic", "unsupported". '
+        'If intent is "Point of Contact": '
+        '- Extract job titles from the user text (do NOT default; use what they asked for, e.g., "marketing supervisor"). '
+        '- Infer the most likely company domain(s) from company names; correct misspellings (e.g., "Mattell" -> "mattel.com"). '
+        '- Extract a numeric count (default 5 if none). '
+        'Never return empty arrays; use null when not applicable. '
+        'Example input: "Find 3 marketing supervisors at Mattell" '
+        'Example output: {"intent":"Point of Contact","titles":["marketing supervisor"],"domains":["mattel.com"],"count":3}'
     )
 
     try:
@@ -148,18 +180,24 @@ def extract_intent():
                 {"role": "user", "content": user_text}
             ],
             model=MODEL_INTENT,
-            max_tokens=120,
+            max_tokens=160,
             temperature=0
         )
         obj = json.loads(content)
     except Exception:
         obj = {"intent": "unsupported", "titles": None, "domains": None, "count": None}
 
-    intent = obj.get("intent") or "unsupported"
-    titles = obj.get("titles") if intent == "Point of Contact" else None
-    domains = obj.get("domains") if intent == "Point of Contact" else None
-    count = obj.get("count") if intent == "Point of Contact" else None
-    count = ensure_int(count, default=5, low=1, high=20) if count is not None else None
+    # normalize and gate fields
+    intent = (obj.get("intent") or "unsupported").strip()
+    if intent == "Point of Contact":
+        titles = obj.get("titles")
+        domains = obj.get("domains")
+        count = obj.get("count")
+        count = ensure_int(count, default=5, low=1, high=20) if count is not None else None
+    else:
+        titles = None
+        domains = None
+        count = None
 
     return jsonify({
         "intent": intent,
@@ -181,6 +219,7 @@ def find_person():
     titles = data.get("titles") or []
     domains = data.get("domains") or []
     count = ensure_int(data.get("count"), default=5, low=1, high=20)
+    include_raw = bool(data.get("include_raw", False))  # optional
 
     payload = {
         "person_titles": titles,
@@ -204,7 +243,16 @@ def find_person():
         return http_json_error(f"Apollo request failed: {e}", 502)
 
     contacts = simplify_apollo_contacts(apollo_json)
-    return jsonify({"contacts": contacts, "raw": apollo_json}), 200
+
+    # Return tiny payload by default; include slim raw only if requested
+    resp = {"contacts": contacts}
+    if include_raw:
+        resp["raw"] = {
+            "pagination": apollo_json.get("pagination"),
+            "breadcrumbs": apollo_json.get("breadcrumbs"),
+            # add "people": apollo_json.get("people") for deep debugging if you want
+        }
+    return jsonify(resp), 200
 
 @app.post("/format-response")
 def format_response():
@@ -226,8 +274,9 @@ def format_response():
             system_msg = (
                 "You are a concise, friendly assistant. You will be given structured results. "
                 "Write a short, conversational reply that summarizes the key info for the user. "
-                "If contacts exist, list 3–6 with name, title, location, and a LinkedIn link if available. "
-                "If no data is available, ask a brief clarifying question."
+                "List 3–6 contacts. For each contact, show: Name, Title, Location, Email status. "
+                "Include LinkedIn, Email, and Phone only if provided (omit blank). "
+                "If no contacts, ask a brief clarifying question."
             )
             user_content = json.dumps({
                 "intent": intent,
@@ -235,9 +284,8 @@ def format_response():
                 "contacts": contacts,
                 "notes": notes
             }, ensure_ascii=False)
-
         else:
-            # Fallback for "unsupported" or other custom intents → treat as ChatGPT-style Q&A
+            # Fallback for "unsupported" or any other intent → behave like ChatGPT
             system_msg = "You are ChatGPT, a helpful assistant. Respond to the user naturally and helpfully."
             user_content = original_query
 
@@ -247,7 +295,7 @@ def format_response():
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_content}
             ],
-            max_tokens=300,
+            max_tokens=320,
             temperature=0.3
         )
         text = (resp.choices[0].message.content or "").strip()
