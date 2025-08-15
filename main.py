@@ -324,17 +324,24 @@ def format_response():
     data = request.get_json(silent=True) or {}
     intent = (data.get("intent") or "").strip()
     original_query = (data.get("original_query") or "").strip()
-    contacts: List[dict] = data.get("contacts") or []
+    contacts = data.get("contacts") or []
     notes = (data.get("notes") or "").strip()
 
-    # Resolve the desired count robustly
+    # NEW: fallback if Bubble sends a stringified list
+    if not contacts:
+        cj = data.get("contacts_json")
+        if isinstance(cj, str) and cj.strip():
+            try:
+                contacts = json.loads(cj)
+            except Exception:
+                contacts = []
+
     count = ensure_int(
-        data.get("count") or
-        data.get("count_requested") or
-        data.get("count_returned") or
-        len(contacts),
+        data.get("count") or data.get("count_requested") or
+        data.get("count_returned") or len(contacts),
         default=5, low=1, high=20
     )
+    
 
     if client is None:
         return http_json_error("OPENAI_API_KEY is not set on the server.", 500)
