@@ -12,8 +12,8 @@ app = Flask(__name__)
 
 # ===== CORS (restrict to your Bubble domains) =====
 ALLOWED_ORIGINS = [
-    "https://your-app.bubbleapps.io",   # <-- replace with your Bubble dev domain
-    "https://www.yourdomain.com"        # <-- replace (or remove if not using custom domain)
+    "https://slfinal.bubbleapps.io",   # your Bubble dev/live origin (no path/query)
+    "https://www.yourdomain.com"       # replace/remove if not using a custom domain
 ]
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 
@@ -47,6 +47,14 @@ def ensure_int(n, default=5, low=1, high=20):
         return n
     except Exception:
         return default
+
+def as_bool(v, default=False):
+    """Robust boolean casting for values coming from JSON (true/false/1/0/'true'/'false')."""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("true", "1", "yes", "y")
 
 # ---------- Apollo → compact contacts ----------
 def simplify_apollo_contacts(raw):
@@ -130,7 +138,7 @@ def index():
         "<ul>"
         "<li><code>/extract-intent</code> — body: {\"text\":\"...\"}</li>"
         "<li><code>/find-person</code> — body: {\"titles\":[],\"domains\":[],\"count\":5, \"include_raw\": false}</li>"
-        "<li><code>/format-response</code> — body: {intent, original_query, contacts[], notes}</li>"
+        "<li><code>/format-response</code> — body: {intent, original_query, contacts[], notes, count}</li>"
         "</ul>"
         "<p>Health: <a href='/health'>/health</a></p>",
         200
@@ -193,7 +201,8 @@ def extract_intent():
         titles = obj.get("titles")
         domains = obj.get("domains")
         count = obj.get("count")
-        count = ensure_int(count, default=3, low=1, high=5) if count is not None else None
+        # Allow up to 20 to match downstream endpoints
+        count = ensure_int(count, default=5, low=1, high=20) if count is not None else None
     else:
         titles = None
         domains = None
@@ -219,12 +228,12 @@ def find_person():
     titles = data.get("titles") or []
     domains = data.get("domains") or []
     count = ensure_int(data.get("count"), default=5, low=1, high=20)
-    include_raw = bool(data.get("include_raw", False))  # optional
+    include_raw = as_bool(data.get("include_raw"), default=False)  # robust parsing
 
     payload = {
         "person_titles": titles,
         "q_organization_domains_list": domains,
-        "contact_email_status": ["verified"],
+        "contact_email_status": ["verified"],  # optional filter
         "per_page": count,
         "page": 1
     }
@@ -255,7 +264,6 @@ def find_person():
         }
     return jsonify(resp), 200
 
-
 @app.post("/format-response")
 def format_response():
     unauthorized = require_backend_token()
@@ -268,7 +276,7 @@ def format_response():
     contacts = data.get("contacts") or []
     notes = (data.get("notes") or "").strip()
 
-    # NEW: resolve the desired count robustly
+    # Resolve the desired count robustly
     count = ensure_int(
         data.get("count") or
         data.get("count_requested") or
@@ -297,6 +305,7 @@ def format_response():
                 "count_requested": count
             }, ensure_ascii=False)
         else:
+            # Fallback for unsupported or other intents → ChatGPT-style response
             system_msg = "You are ChatGPT, a helpful assistant. Respond to the user naturally and helpfully."
             user_content = original_query
 
