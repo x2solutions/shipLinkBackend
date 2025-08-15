@@ -193,7 +193,7 @@ def extract_intent():
         titles = obj.get("titles")
         domains = obj.get("domains")
         count = obj.get("count")
-        count = ensure_int(count, default=5, low=1, high=20) if count is not None else None
+        count = ensure_int(count, default=3, low=1, high=5) if count is not None else None
     else:
         titles = None
         domains = None
@@ -224,7 +224,7 @@ def find_person():
     payload = {
         "person_titles": titles,
         "q_organization_domains_list": domains,
-        "contact_email_status": ["verified"],  # optional filter
+        "contact_email_status": ["verified"],
         "per_page": count,
         "page": 1
     }
@@ -243,16 +243,18 @@ def find_person():
         return http_json_error(f"Apollo request failed: {e}", 502)
 
     contacts = simplify_apollo_contacts(apollo_json)
-
-    # Return tiny payload by default; include slim raw only if requested
-    resp = {"contacts": contacts}
+    resp = {
+        "contacts": contacts,
+        "count_requested": count,
+        "count_returned": len(contacts),
+    }
     if include_raw:
         resp["raw"] = {
             "pagination": apollo_json.get("pagination"),
             "breadcrumbs": apollo_json.get("breadcrumbs"),
-            # add "people": apollo_json.get("people") for deep debugging if you want
         }
     return jsonify(resp), 200
+
 
 @app.post("/format-response")
 def format_response():
@@ -263,8 +265,17 @@ def format_response():
     data = request.get_json(silent=True) or {}
     intent = (data.get("intent") or "").strip()
     original_query = (data.get("original_query") or "").strip()
-    contacts = (data.get("contacts") or [])[:10]
+    contacts = data.get("contacts") or []
     notes = (data.get("notes") or "").strip()
+
+    # NEW: resolve the desired count robustly
+    count = ensure_int(
+        data.get("count") or
+        data.get("count_requested") or
+        data.get("count_returned") or
+        len(contacts),
+        default=5, low=1, high=20
+    )
 
     if client is None:
         return http_json_error("OPENAI_API_KEY is not set on the server.", 500)
@@ -272,20 +283,20 @@ def format_response():
     try:
         if intent == "Point of Contact":
             system_msg = (
-                "You are a concise, friendly assistant. You will be given structured results. "
-                "Write a short, conversational reply that summarizes the key info for the user. "
-                "List 3–6 contacts. For each contact, show: Name, Title, Location, Email status. "
-                "Include LinkedIn, Email, and Phone only if provided (omit blank). "
-                "If no contacts, ask a brief clarifying question."
+                f"You are a concise, friendly assistant. You will be given structured results. "
+                f"Write a short, conversational reply that summarizes the key info for the user. "
+                f"List up to {count} contacts. For each contact, show: Name, Title, Location, Email status. "
+                f"Include LinkedIn, Email, and Phone only if provided (omit blank). "
+                f"If no contacts, ask a brief clarifying question."
             )
             user_content = json.dumps({
                 "intent": intent,
                 "original_query": original_query,
-                "contacts": contacts,
-                "notes": notes
+                "contacts": (contacts or [])[:count],  # enforce the limit
+                "notes": notes,
+                "count_requested": count
             }, ensure_ascii=False)
         else:
-            # Fallback for "unsupported" or any other intent → behave like ChatGPT
             system_msg = "You are ChatGPT, a helpful assistant. Respond to the user naturally and helpfully."
             user_content = original_query
 
