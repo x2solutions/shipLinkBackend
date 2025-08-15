@@ -2,7 +2,7 @@
 import os
 import json
 import requests
-from typing import Optional
+from typing import Optional, Any, List
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -12,8 +12,8 @@ app = Flask(__name__)
 
 # ===== CORS (restrict to your Bubble domains) =====
 ALLOWED_ORIGINS = [
-    "https://slfinal.bubbleapps.io",   # your Bubble dev/live origin (no path/query)
-    "https://www.yourdomain.com"       # replace/remove if not using a custom domain
+    "https://slfinal.bubbleapps.io",    # <-- replace with your Bubble dev domain
+    "https://www.yourdomain.com",        # <-- replace (or remove if not using custom domain)
 ]
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 
@@ -29,6 +29,7 @@ client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else
 MODEL_INTENT = "gpt-4o-mini"
 MODEL_FORMAT = "gpt-4o-mini"
 APOLLO_BASE = "https://api.apollo.io/api/v1/mixed_people/search"
+
 
 # ---------- Utility ----------
 def http_json_error(msg, code=400, extra=None):
@@ -48,13 +49,18 @@ def ensure_int(n, default=5, low=1, high=20):
     except Exception:
         return default
 
-def as_bool(v, default=False):
-    """Robust boolean casting for values coming from JSON (true/false/1/0/'true'/'false')."""
+def as_bool(v: Any, default: bool = False) -> bool:
     if isinstance(v, bool):
         return v
     if v is None:
         return default
-    return str(v).strip().lower() in ("true", "1", "yes", "y")
+    s = str(v).strip().lower()
+    if s in ("true", "1", "yes", "y"):
+        return True
+    if s in ("false", "0", "no", "n"):
+        return False
+    return default
+
 
 # ---------- Apollo → compact contacts ----------
 def simplify_apollo_contacts(raw):
@@ -101,6 +107,7 @@ def simplify_apollo_contacts(raw):
         })
     return out
 
+
 # ----- simple header auth for Bubble → backend -----
 def require_backend_token():
     if not BACKEND_TOKEN:  # if you haven't set it, skip check (useful during local dev)
@@ -109,6 +116,7 @@ def require_backend_token():
     if token != BACKEND_TOKEN:
         return jsonify({"error": "Unauthorized"}), 401
     return None
+
 
 # ---------- OpenAI helper ----------
 @retry(
@@ -119,6 +127,7 @@ def require_backend_token():
 )
 def chat_json(messages, model=MODEL_INTENT, max_tokens=150, temperature=0):
     if client is None:
+        # Fail fast with clear message instead of AttributeError
         raise RuntimeError("OPENAI_API_KEY is not set on the server.")
     resp = client.chat.completions.create(
         model=model,
@@ -128,6 +137,7 @@ def chat_json(messages, model=MODEL_INTENT, max_tokens=150, temperature=0):
         temperature=temperature
     )
     return resp.choices[0].message.content  # guaranteed JSON string
+
 
 # ---------- Friendly GET routes so browser tests don't 404 ----------
 @app.get("/")
@@ -153,6 +163,7 @@ def health():
         "auth_required": bool(BACKEND_TOKEN)
     }), 200
 
+
 # ---------- POST endpoints used by Bubble ----------
 @app.post("/extract-intent")
 def extract_intent():
@@ -167,18 +178,33 @@ def extract_intent():
             "intent": "unsupported", "titles": None, "domains": None, "count": None
         })
 
-    # More prescriptive and domain-savvy classification
+    # Tight, conservative classifier
     system_msg = (
-        'Return ONLY JSON with keys exactly: '
+        "Return ONLY JSON with keys exactly: "
         '{"intent": string, "titles": array|null, "domains": array|null, "count": number|null}. '
-        'Classify intent as one of: "Point of Contact", "Data Traffic", "unsupported". '
-        'If intent is "Point of Contact": '
-        '- Extract job titles from the user text (do NOT default; use what they asked for, e.g., "marketing supervisor"). '
-        '- Infer the most likely company domain(s) from company names; correct misspellings (e.g., "Mattell" -> "mattel.com"). '
-        '- Extract a numeric count (default 5 if none). '
-        'Never return empty arrays; use null when not applicable. '
-        'Example input: "Find 3 marketing supervisors at Mattell" '
-        'Example output: {"intent":"Point of Contact","titles":["marketing supervisor"],"domains":["mattel.com"],"count":3}'
+
+        'Intent rules: '
+        '"Point of Contact" ONLY when the user clearly asks to find people at a company '
+        '(e.g., “find 3 marketing managers at Mattel”, “get ecommerce managers at walmart.com”). '
+        'This REQUIRES BOTH (1) at least one role/title AND (2) a company name or domain. '
+        '"Data Traffic" is for questions about web/app traffic, visitors, MAUs, etc. '
+        'All other general knowledge or chit‑chat is "unsupported". '
+
+        'If intent is "Point of Contact", extract: '
+        '`titles` (array of normalized titles from the text), '
+        '`domains` (array of company domains inferred from company names; fix misspellings: Mattell→mattel.com), '
+        '`count` (integer; default 5 if none). '
+
+        'If either titles OR domains is missing/uncertain, set intent to "unsupported". '
+        'Never guess extra titles or domains. Never return empty arrays; use null. '
+
+        'Examples:\n'
+        'User: "Find 3 marketing supervisors at Mattell" → '
+        '{"intent":"Point of Contact","titles":["marketing supervisor"],"domains":["mattel.com"],"count":3}\n'
+        'User: "What are the primary colors?" → '
+        '{"intent":"unsupported","titles":null,"domains":null,"count":null}\n'
+        'User: "Show web traffic for nike.com last year" → '
+        '{"intent":"Data Traffic","titles":null,"domains":["nike.com"],"count":null}'
     )
 
     try:
@@ -188,32 +214,54 @@ def extract_intent():
                 {"role": "user", "content": user_text}
             ],
             model=MODEL_INTENT,
-            max_tokens=160,
+            max_tokens=180,
             temperature=0
         )
         obj = json.loads(content)
     except Exception:
         obj = {"intent": "unsupported", "titles": None, "domains": None, "count": None}
 
-    # normalize and gate fields
+    # normalize + HARD GUARDS
     intent = (obj.get("intent") or "unsupported").strip()
+
+    def nonempty_list(x: Any) -> bool:
+        return isinstance(x, list) and any(str(i).strip() for i in x)
+
     if intent == "Point of Contact":
         titles = obj.get("titles")
         domains = obj.get("domains")
         count = obj.get("count")
-        # Allow up to 20 to match downstream endpoints
-        count = ensure_int(count, default=5, low=1, high=20) if count is not None else None
-    else:
-        titles = None
-        domains = None
-        count = None
 
+        if not nonempty_list(titles) or not nonempty_list(domains):
+            intent, titles, domains, count = "unsupported", None, None, None
+        else:
+            count = ensure_int(count, default=3, low=1, high=5)
+
+        return jsonify({
+            "intent": intent,
+            "titles": titles,
+            "domains": domains,
+            "count": count
+        }), 200
+
+    elif intent == "Data Traffic":
+        # keep domains if the model extracted them; Bubble can decide how to use
+        domains = obj.get("domains") if nonempty_list(obj.get("domains")) else None
+        return jsonify({
+            "intent": "Data Traffic",
+            "titles": None,
+            "domains": domains,
+            "count": None
+        }), 200
+
+    # Fallback: unsupported
     return jsonify({
-        "intent": intent,
-        "titles": titles,
-        "domains": domains,
-        "count": count
+        "intent": "unsupported",
+        "titles": None,
+        "domains": None,
+        "count": None
     }), 200
+
 
 @app.post("/find-person")
 def find_person():
@@ -228,11 +276,12 @@ def find_person():
     titles = data.get("titles") or []
     domains = data.get("domains") or []
     count = ensure_int(data.get("count"), default=5, low=1, high=20)
+    include_raw = as_bool(data.get("include_raw"), False)  # robust boolean parsing
 
     payload = {
         "person_titles": titles,
         "q_organization_domains_list": domains,
-        "contact_email_status": ["verified"],
+        "contact_email_status": ["verified"],  # you can relax this if needed
         "per_page": count,
         "page": 1
     }
@@ -252,12 +301,18 @@ def find_person():
 
     contacts = simplify_apollo_contacts(apollo_json)
 
-    # Force compact payload only
-    return jsonify({
+    resp = {
         "contacts": contacts,
         "count_requested": count,
         "count_returned": len(contacts),
-    }), 200
+    }
+    # Only include a tiny debug raw when explicitly requested
+    if include_raw:
+        resp["raw"] = {
+            "pagination": apollo_json.get("pagination"),
+            "breadcrumbs": apollo_json.get("breadcrumbs"),
+        }
+    return jsonify(resp), 200
 
 
 @app.post("/format-response")
@@ -269,7 +324,7 @@ def format_response():
     data = request.get_json(silent=True) or {}
     intent = (data.get("intent") or "").strip()
     original_query = (data.get("original_query") or "").strip()
-    contacts = data.get("contacts") or []
+    contacts: List[dict] = data.get("contacts") or []
     notes = (data.get("notes") or "").strip()
 
     # Resolve the desired count robustly
@@ -296,14 +351,15 @@ def format_response():
             user_content = json.dumps({
                 "intent": intent,
                 "original_query": original_query,
-                "contacts": (contacts or [])[:count],  # enforce the limit
+                "contacts": (contacts or [])[:count],  # enforce limit server-side
                 "notes": notes,
                 "count_requested": count
             }, ensure_ascii=False)
+
         else:
-            # Fallback for unsupported or other intents → ChatGPT-style response
+            # Generic path – act like normal ChatGPT
             system_msg = "You are ChatGPT, a helpful assistant. Respond to the user naturally and helpfully."
-            user_content = original_query
+            user_content = original_query or "Hello"
 
         resp = client.chat.completions.create(
             model=MODEL_FORMAT,
@@ -319,6 +375,7 @@ def format_response():
         return http_json_error(f"OpenAI formatting failed: {e}", 502)
 
     return jsonify({"message": text}), 200
+
 
 if __name__ == "__main__":
     # Render/Replit proxy: bind to env PORT (falls back to 8000 locally)
