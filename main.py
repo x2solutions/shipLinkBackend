@@ -10,10 +10,10 @@ from openai import OpenAI
 
 app = Flask(__name__)
 
-# ===== CORS (restrict to your Bubble domains) =====
+# ===== CORS (restrict to  Bubble domains) =====
 ALLOWED_ORIGINS = [
-    "https://slfinal.bubbleapps.io",    # <-- replace with your Bubble dev domain
-    "https://www.yourdomain.com",        # <-- replace (or remove if not using custom domain)
+    "https://slfinal.bubbleapps.io",   
+    #"https://www.WhateverShipLinkDomain.com",        # <-- replace custom domain
 ]
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 
@@ -108,7 +108,7 @@ def simplify_apollo_contacts(raw):
     return out
 
 
-# ----- simple header auth for Bubble → backend -----
+# -----  header auth for Bubble → backend -----
 def require_backend_token():
     if not BACKEND_TOKEN:  # if you haven't set it, skip check (useful during local dev)
         return None
@@ -178,7 +178,7 @@ def extract_intent():
             "intent": "unsupported", "titles": None, "domains": None, "count": None
         })
 
-    # Tight, conservative classifier
+    # conservative classifier
     system_msg = (
         "Return ONLY JSON with keys exactly: "
         '{"intent": string, "titles": array|null, "domains": array|null, "count": number|null}. '
@@ -281,7 +281,7 @@ def find_person():
     payload = {
         "person_titles": titles,
         "q_organization_domains_list": domains,
-        "contact_email_status": ["verified"],  # you can relax this if needed
+        "contact_email_status": ["verified"],  
         "per_page": count,
         "page": 1
     }
@@ -327,7 +327,7 @@ def format_response():
     contacts = data.get("contacts") or []
     notes = (data.get("notes") or "").strip()
 
-    # NEW: fallback if Bubble sends a stringified list
+    # fallback if Bubble sends a stringified list
     if not contacts:
         cj = data.get("contacts_json")
         if isinstance(cj, str) and cj.strip():
